@@ -65,7 +65,7 @@
 
     .stats {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 12px;
       margin-top: 18px;
     }
@@ -369,6 +369,13 @@
       accent-color: var(--accent);
     }
 
+    .check-stack {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
     .hidden { display: none !important; }
 
     .footer-note {
@@ -452,6 +459,7 @@
             <button type="button" class="soft" data-filter="all">All</button>
             <button type="button" data-filter="pending">Unsent</button>
             <button type="button" data-filter="sent">Sent</button>
+            <button type="button" data-filter="confirmed">Confirmed</button>
             <button type="button" data-filter="needs-contact">Needs Contact Info</button>
           </div>
         </div>
@@ -500,9 +508,11 @@
         <hr style="border:none;border-top:1px solid var(--line);margin:18px 0;" />
 
         <div class="btn-row">
+          <button id="import-json" type="button">Import tracker JSON</button>
           <button id="download-json" type="button">Download tracker JSON</button>
           <button id="reset-data" class="danger" type="button">Reset all progress</button>
         </div>
+        <input id="import-file" type="file" accept=".json,application/json" class="hidden" />
 
         <p class="footer-note">Notes such as “Nancy Haris,” “Ask Bryan,” “Ask Anna,” and “It is Dr. Graves” were stored as contact reminders instead of email addresses because they were not written as emails in your source list.</p>
       </aside>
@@ -661,12 +671,7 @@ contact@delairecdc.org`;
         sent: false,
         sentDate: '',
       }
-    ].map(org => ({
-      ...org,
-      selectedEmail: org.emails[0] || '',
-      subject: applyTemplate(defaultSubjectTemplate, { ...org, selectedEmail: org.emails[0] || '' }),
-      body: applyTemplate(defaultBodyTemplate, { ...org, selectedEmail: org.emails[0] || '' }),
-    }));
+    ].map(org => normalizeOrg(org, defaultSubjectTemplate, defaultBodyTemplate));
 
     let state = loadState();
     let activeFilter = state.activeFilter || 'all';
@@ -680,6 +685,7 @@ contact@delairecdc.org`;
       newName: document.getElementById('new-name'),
       newEmails: document.getElementById('new-emails'),
       newNote: document.getElementById('new-note'),
+      importFile: document.getElementById('import-file'),
       toast: document.getElementById('toast')
     };
 
@@ -744,17 +750,16 @@ contact@delairecdc.org`;
       }
       const emails = parseEmails(els.newEmails.value);
       const note = els.newNote.value.trim();
-      state.orgs.unshift({
+      state.orgs.unshift(normalizeOrg({
         id: uid(),
         name,
         emails,
         note,
         sent: false,
         sentDate: '',
-        selectedEmail: emails[0] || '',
-        subject: applyTemplate(state.globalSubjectTemplate, { name, emails, selectedEmail: emails[0] || '', note }),
-        body: applyTemplate(state.globalBodyTemplate, { name, emails, selectedEmail: emails[0] || '', note }),
-      });
+        confirmed: false,
+        notes: ''
+      }, state.globalSubjectTemplate, state.globalBodyTemplate));
       els.newName.value = '';
       els.newEmails.value = '';
       els.newNote.value = '';
@@ -772,6 +777,40 @@ contact@delairecdc.org`;
       a.click();
       URL.revokeObjectURL(url);
       toast('Tracker JSON downloaded.');
+    });
+
+    document.getElementById('import-json').addEventListener('click', () => {
+      els.importFile.click();
+    });
+
+    els.importFile.addEventListener('change', async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const nextState = buildImportedState(parsed);
+        if (!nextState) {
+          toast('That JSON file is not in a supported format.');
+          return;
+        }
+
+        state = nextState;
+        activeFilter = state.activeFilter || 'all';
+        els.globalSubject.value = state.globalSubjectTemplate;
+        els.globalBody.value = state.globalBodyTemplate;
+        els.search.value = state.search || '';
+        document.querySelectorAll('[data-filter]').forEach(b => b.classList.toggle('soft', b.dataset.filter === activeFilter));
+        persist();
+        render();
+        toast(`Imported ${state.orgs.length} organizations from JSON.`);
+      } catch (err) {
+        console.error(err);
+        toast('Could not import that JSON file.');
+      } finally {
+        event.target.value = '';
+      }
     });
 
     document.getElementById('reset-data').addEventListener('click', () => {
@@ -810,23 +849,11 @@ contact@delairecdc.org`;
           globalBodyTemplate: parsed.globalBodyTemplate || defaultBodyTemplate,
           activeFilter: parsed.activeFilter || 'all',
           search: parsed.search || '',
-          orgs: parsed.orgs.map(org => {
-            const emails = Array.isArray(org.emails) ? org.emails : [];
-            const normalized = {
-              id: org.id || uid(),
-              name: org.name || 'Untitled Organization',
-              emails,
-              selectedEmail: emails.includes(org.selectedEmail) ? org.selectedEmail : (emails[0] || ''),
-              note: org.note || '',
-              sent: Boolean(org.sent),
-              sentDate: org.sentDate || ''
-            };
-            return {
-              ...normalized,
-              subject: org.subject || applyTemplate(parsed.globalSubjectTemplate || defaultSubjectTemplate, normalized),
-              body: org.body || applyTemplate(parsed.globalBodyTemplate || defaultBodyTemplate, normalized)
-            };
-          })
+          orgs: parsed.orgs.map(org => normalizeOrg(
+            org,
+            parsed.globalSubjectTemplate || defaultSubjectTemplate,
+            parsed.globalBodyTemplate || defaultBodyTemplate
+          ))
         };
       } catch (err) {
         console.error(err);
@@ -847,8 +874,8 @@ contact@delairecdc.org`;
       const total = state.orgs.length;
       const sent = state.orgs.filter(org => org.sent).length;
       const unsent = total - sent;
+      const confirmed = state.orgs.filter(org => org.confirmed).length;
       const needsContact = state.orgs.filter(org => org.emails.length === 0).length;
-      const withContactNotes = state.orgs.filter(org => org.note.trim()).length;
       els.stats.innerHTML = `
         <div class="stat">
           <div class="kicker">Total Orgs</div>
@@ -863,6 +890,10 @@ contact@delairecdc.org`;
           <div class="value">${unsent}</div>
         </div>
         <div class="stat">
+          <div class="kicker">Confirmed</div>
+          <div class="value">${confirmed}</div>
+        </div>
+        <div class="stat">
           <div class="kicker">Need Email Address</div>
           <div class="value">${needsContact}</div>
         </div>
@@ -872,12 +903,13 @@ contact@delairecdc.org`;
     function renderList() {
       const query = els.search.value.trim().toLowerCase();
       const visible = state.orgs.filter(org => {
-        const hay = [org.name, org.note, org.selectedEmail, org.emails.join(', '), org.subject, org.body].join(' ').toLowerCase();
+        const hay = [org.name, org.note, org.notes, org.selectedEmail, org.emails.join(', '), org.subject, org.body].join(' ').toLowerCase();
         const matchesSearch = !query || hay.includes(query);
         const matchesFilter =
           activeFilter === 'all' ? true :
           activeFilter === 'sent' ? org.sent :
           activeFilter === 'pending' ? !org.sent :
+          activeFilter === 'confirmed' ? org.confirmed :
           activeFilter === 'needs-contact' ? org.emails.length === 0 : true;
         return matchesSearch && matchesFilter;
       });
@@ -905,6 +937,13 @@ contact@delairecdc.org`;
           }));
         });
 
+        document.getElementById(`confirmed-${id}`).addEventListener('change', (e) => {
+          updateOrg(org.id, current => ({
+            ...current,
+            confirmed: e.target.checked
+          }));
+        });
+
         document.getElementById(`emails-${id}`).addEventListener('input', (e) => {
           updateOrg(org.id, current => {
             const emails = parseEmails(e.target.value);
@@ -916,8 +955,24 @@ contact@delairecdc.org`;
           }, false);
         });
 
+        document.getElementById(`emails-${id}`).addEventListener('blur', () => {
+          render();
+        });
+
         document.getElementById(`note-${id}`).addEventListener('input', (e) => {
           updateOrg(org.id, current => ({ ...current, note: e.target.value }), false);
+        });
+
+        document.getElementById(`note-${id}`).addEventListener('blur', () => {
+          render();
+        });
+
+        document.getElementById(`notes-${id}`).addEventListener('input', (e) => {
+          updateOrg(org.id, current => ({ ...current, notes: e.target.value }), false);
+        });
+
+        document.getElementById(`notes-${id}`).addEventListener('blur', () => {
+          render();
         });
 
         document.getElementById(`subject-${id}`).addEventListener('input', (e) => {
@@ -1008,14 +1063,22 @@ contact@delairecdc.org`;
               <h3>${escapeHtml(org.name)}</h3>
               <div class="tag-row">
                 <span class="tag ${org.sent ? 'sent' : 'pending'}">${org.sent ? 'Sent' : 'Not Sent'}</span>
+                <span class="tag ${org.confirmed ? 'sent' : 'pending'}">${org.confirmed ? 'Confirmed' : 'Unconfirmed'}</span>
                 ${needsContact ? '<span class="tag warning">Needs Email Address</span>' : '<span class="tag">Has Email Address</span>'}
                 ${org.note.trim() ? '<span class="tag">Has Contact Note</span>' : ''}
+                ${org.notes.trim() ? '<span class="tag">Has Notes</span>' : ''}
               </div>
             </div>
-            <label class="check-line" for="sent-${id}">
-              <input id="sent-${id}" type="checkbox" ${org.sent ? 'checked' : ''} />
-              Mark email sent
-            </label>
+            <div class="check-stack">
+              <label class="check-line" for="confirmed-${id}">
+                <input id="confirmed-${id}" type="checkbox" ${org.confirmed ? 'checked' : ''} />
+                Mark confirmed
+              </label>
+              <label class="check-line" for="sent-${id}">
+                <input id="sent-${id}" type="checkbox" ${org.sent ? 'checked' : ''} />
+                Mark email sent
+              </label>
+            </div>
           </div>
 
           <div class="org-meta">
@@ -1056,6 +1119,11 @@ contact@delairecdc.org`;
             </div>
 
             <div class="field full">
+              <label for="notes-${id}">Notes</label>
+              <textarea id="notes-${id}" placeholder="Add any notes for this organization">${escapeHtml(org.notes || '')}</textarea>
+            </div>
+
+            <div class="field full">
               <label for="subject-${id}">Subject</label>
               <input id="subject-${id}" type="text" value="${escapeAttr(org.subject)}" />
             </div>
@@ -1087,6 +1155,61 @@ contact@delairecdc.org`;
 
     function getOrg(id) {
       return state.orgs.find(org => org.id === id);
+    }
+
+    function buildImportedState(parsed) {
+      if (Array.isArray(parsed)) {
+        return {
+          globalSubjectTemplate: state.globalSubjectTemplate || defaultSubjectTemplate,
+          globalBodyTemplate: state.globalBodyTemplate || defaultBodyTemplate,
+          activeFilter: 'all',
+          search: '',
+          orgs: parsed.map(org => normalizeOrg(
+            org,
+            state.globalSubjectTemplate || defaultSubjectTemplate,
+            state.globalBodyTemplate || defaultBodyTemplate
+          ))
+        };
+      }
+
+      if (!parsed || !Array.isArray(parsed.orgs)) {
+        return null;
+      }
+
+      const subjectTemplate = parsed.globalSubjectTemplate || defaultSubjectTemplate;
+      const bodyTemplate = parsed.globalBodyTemplate || defaultBodyTemplate;
+
+      return {
+        globalSubjectTemplate: subjectTemplate,
+        globalBodyTemplate: bodyTemplate,
+        activeFilter: parsed.activeFilter || 'all',
+        search: parsed.search || '',
+        orgs: parsed.orgs.map(org => normalizeOrg(org, subjectTemplate, bodyTemplate))
+      };
+    }
+
+    function normalizeOrg(org, subjectTemplate, bodyTemplate) {
+      const emails = Array.isArray(org && org.emails)
+        ? org.emails.map(email => String(email || '').trim()).filter(Boolean)
+        : parseEmails(org && org.emails);
+      const selectedEmail = emails.includes(org && org.selectedEmail) ? org.selectedEmail : (emails[0] || '');
+      const normalized = {
+        id: org && org.id ? String(org.id) : uid(),
+        name: org && org.name ? String(org.name) : 'Untitled Organization',
+        emails,
+        selectedEmail,
+        note: org && org.note ? String(org.note) : '',
+        notes: org && org.notes ? String(org.notes) : '',
+        confirmed: Boolean(org && org.confirmed),
+        sent: Boolean(org && org.sent),
+        sentDate: org && org.sentDate ? String(org.sentDate) : ''
+      };
+
+      return {
+        ...normalized,
+        subject: org && org.subject ? String(org.subject) : applyTemplate(subjectTemplate, normalized),
+        body: org && org.body ? String(org.body) : applyTemplate(bodyTemplate, normalized)
+      };
     }
 
     function applyTemplate(template, org) {
